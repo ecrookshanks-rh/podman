@@ -1128,53 +1128,23 @@ func (c *Container) CgroupPath() (string, error) {
 	return c.cGroupPath()
 }
 
-// cGroupPath returns a cgroups "path" for the given container.
-// Note that the container must be running.  Otherwise, an error
-// is returned.
-// NOTE: only call this when owning the container's lock.
-func (c *Container) cGroupPath() (string, error) {
-	if c.config.NoCgroups || c.config.CgroupsMode == "disabled" {
-		return "", fmt.Errorf("this container is not creating cgroups: %w", define.ErrNoCgroups)
-	}
-	if c.state.State != define.ContainerStateRunning && c.state.State != define.ContainerStatePaused {
-		return "", fmt.Errorf("cannot get cgroup path unless container %s is running: %w", c.ID(), define.ErrCtrStopped)
-	}
-
-	// Read /proc/{PID}/cgroup and find the *longest* cgroup entry.  That's
-	// needed to account for hacks in cgroups v1, where each line in the
-	// file could potentially point to a cgroup.  The longest one, however,
-	// is the libpod-specific one we're looking for.
-	//
-	// See #8397 on the need for the longest-path look up.
-	//
-	// And another workaround for containers running systemd as the payload.
-	// containers running systemd moves themselves into a child subgroup of
-	// the named systemd cgroup hierarchy.  Ignore any named cgroups during
-	// the lookup.
-	// See #10602 for more details.
-	procPath := fmt.Sprintf("/proc/%d/cgroup", c.state.PID)
-	lines, err := os.ReadFile(procPath)
-	if err != nil {
-		// If the file doesn't exist, it means the container could have been terminated
-		// so report it.  Also check for ESRCH, which means the container could have been
-		// terminated after the file under /proc was opened but before it was read.
-		if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ESRCH) {
-			return "", fmt.Errorf("cannot get cgroup path unless container %s is running: %w", c.ID(), define.ErrCtrStopped)
-		}
-		return "", err
-	}
-
+// parseCgroupPath parses the contents of a /proc/<pid>/cgroup file and returns
+// the longest cgroup path found.  The longest path is used to account for
+// cgroups v1 hierarchies (see #8397).  Named cgroups (e.g., name=systemd) are
+// ignored to work around containers running systemd as payload (see #10602).
+func parseCgroupPath(procCgroupData []byte) (string, error) {
 	var cgroupPath string
-	for line := range bytes.SplitSeq(lines, []byte("\n")) {
+
+	for line := range bytes.SplitSeq(procCgroupData, []byte("\n")) {
 		// skip last empty line
 		if len(line) == 0 {
 			continue
 		}
 		// cgroups(7) nails it down to three fields with the 3rd
 		// pointing to the cgroup's path which works both on v1 and v2.
-		fields := bytes.Split(line, []byte(":"))
+		fields := bytes.SplitN(line, []byte(":"), 3)
 		if len(fields) != 3 {
-			logrus.Debugf("Error parsing cgroup: expected 3 fields but got %d: %s", len(fields), procPath)
+			logrus.Debugf("Error parsing cgroup: expected 3 fields but got %d: %q", len(fields), line)
 			continue
 		}
 		// Ignore named cgroups like name=systemd.
@@ -1188,7 +1158,40 @@ func (c *Container) cGroupPath() (string, error) {
 	}
 
 	if len(cgroupPath) == 0 {
-		return "", fmt.Errorf("could not find any cgroup in %q", procPath)
+		return "", fmt.Errorf("could not find any cgroup path")
+	}
+	return cgroupPath, nil
+}
+
+// cGroupPath returns a cgroups "path" for the given container.
+// Note that the container must be running.  Otherwise, an error
+// is returned.
+// NOTE: only call this when owning the container's lock.
+func (c *Container) cGroupPath() (string, error) {
+	if c.config.NoCgroups || c.config.CgroupsMode == "disabled" {
+		return "", fmt.Errorf("this container is not creating cgroups: %w", define.ErrNoCgroups)
+	}
+	if c.state.State != define.ContainerStateRunning && c.state.State != define.ContainerStatePaused {
+		return "", fmt.Errorf("cannot get cgroup path unless container %s is running: %w", c.ID(), define.ErrCtrStopped)
+	}
+
+	// Parse the cgroup file to find the container's cgroup path.
+	// See parseCgroupPath for details on the lookup heuristics.
+	procPath := fmt.Sprintf("/proc/%d/cgroup", c.state.PID)
+	lines, err := os.ReadFile(procPath)
+	if err != nil {
+		// If the file doesn't exist, it means the container could have been terminated
+		// so report it.  Also check for ESRCH, which means the container could have been
+		// terminated after the file under /proc was opened but before it was read.
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ESRCH) {
+			return "", fmt.Errorf("cannot get cgroup path unless container %s is running: %w", c.ID(), define.ErrCtrStopped)
+		}
+		return "", err
+	}
+
+	cgroupPath, err := parseCgroupPath(lines)
+	if err != nil {
+		return "", fmt.Errorf("%w in %q", err, procPath)
 	}
 
 	cgroupManager := c.CgroupManager()
